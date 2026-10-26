@@ -28,6 +28,9 @@ FEED_URL = (
 STORE_URL = "https://store.epicgames.com/en-US/p/{slug}"
 LOGIN_URL = "https://www.epicgames.com/id/login"
 PROFILE_DIR = Path(__file__).parent / "profile"
+# Epic dropped the purchase-cta-button test id, so also match the button's name
+CTA_NAME = re.compile(r"^\s*(Get|In Library|Owned|Buy Now)\s*$", re.IGNORECASE)
+CDP_URL = "http://localhost:9222"
 CAPTCHA_WAIT_SECONDS = 300  # how long to wait for you to solve a CAPTCHA
 
 
@@ -78,6 +81,7 @@ def find_slug(el):
 def open_browser(p):
     return p.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
+        channel="chrome",  # real Chrome; the bundled Chromium gets blocked more often
         headless=False,  # Epic is much more likely to block a hidden browser
         viewport={"width": 1280, "height": 900},
     )
@@ -110,6 +114,14 @@ def total_is_zero(text):
     return bool(amounts) and all(int(re.sub(r"\D", "", a)) == 0 for a in amounts)
 
 
+def find_cta(page):
+    return (
+        page.locator('[data-testid="purchase-cta-button"]')
+        .or_(page.get_by_role("button", name=CTA_NAME))
+        .first
+    )
+
+
 def click_if_present(locator, timeout=3000):
     try:
         locator.first.click(timeout=timeout)
@@ -128,7 +140,7 @@ def claim(page, game):
     # Some games have an age check before the store page
     click_if_present(page.get_by_role("button", name="Continue"))
 
-    cta = page.locator('[data-testid="purchase-cta-button"]')
+    cta = find_cta(page)
     try:
         cta.wait_for(timeout=15000)
     except PWTimeout:
@@ -175,7 +187,7 @@ def claim(page, game):
         # Fall back to re-checking the button
         page.reload(wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
-        label = (page.locator('[data-testid="purchase-cta-button"]').inner_text() or "").lower()
+        label = (find_cta(page).inner_text() or "").lower()
         if "in library" in label or "owned" in label:
             print("  Claimed!")
             return "claimed"
@@ -199,6 +211,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--login", action="store_true", help="log in and save the session")
     ap.add_argument("--dry-run", action="store_true", help="list free games only")
+    ap.add_argument("--attach", action="store_true",
+                    help=f"drive a Chrome you started yourself with --remote-debugging-port=9222 ({CDP_URL})")
     args = ap.parse_args()
 
     if args.login:
@@ -213,21 +227,31 @@ def main():
     if args.dry_run:
         return
 
-    if not PROFILE_DIR.exists():
+    if not args.attach and not PROFILE_DIR.exists():
         print("No saved login yet. Run: python claimer.py --login")
         sys.exit(1)
 
     results = {}
     with sync_playwright() as p:
-        ctx = open_browser(p)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if args.attach:
+            try:
+                ctx = p.chromium.connect_over_cdp(CDP_URL).contexts[0]
+            except Exception as e:
+                print(f"Couldn't connect to Chrome at {CDP_URL}: {e}")
+                print("Start Chrome with --remote-debugging-port=9222 first (see README).")
+                sys.exit(1)
+            page = ctx.new_page()
+        else:
+            ctx = open_browser(p)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
         for g in games:
             try:
                 results[g["title"]] = claim(page, g)
             except Exception as e:
                 print(f"  Error: {e}")
                 results[g["title"]] = "failed"
-        ctx.close()
+        # In attach mode leave your Chrome open and only close our tab
+        (page if args.attach else ctx).close()
 
     print("\nSummary:")
     for title, status in results.items():
