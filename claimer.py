@@ -12,6 +12,7 @@ and Playwright keeps the session in the ./profile folder (keep that folder priva
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -103,6 +104,12 @@ def wait_for_human_if_captcha(page):
     raise RuntimeError("CAPTCHA wasn't solved in time")
 
 
+def total_is_zero(text):
+    """True only if the checkout text shows a Total and every Total is zero."""
+    amounts = re.findall(r"\btotal\b\D{0,20}?(\d[\d.,]*)", text, re.IGNORECASE)
+    return bool(amounts) and all(int(re.sub(r"\D", "", a)) == 0 for a in amounts)
+
+
 def click_if_present(locator, timeout=3000):
     try:
         locator.first.click(timeout=timeout)
@@ -129,7 +136,7 @@ def claim(page, game):
         return "failed"
 
     label = (cta.inner_text() or "").strip().lower()
-    if "library" in label or "owned" in label:
+    if "in library" in label or "owned" in label:
         print("  Already in your library.")
         return "owned"
     if "get" not in label:
@@ -142,9 +149,18 @@ def claim(page, game):
 
     # Checkout happens inside an iframe
     checkout = page.frame_locator("#webPurchaseContainer iframe")
-    if not click_if_present(checkout.get_by_role("button", name="Place Order"), timeout=20000):
+    place_order = checkout.get_by_role("button", name="Place Order")
+    try:
+        place_order.first.wait_for(timeout=20000)
+    except PWTimeout:
         print("  Couldn't find Place Order.")
         return "failed"
+
+    # Safety: never place an order unless the checkout total is verifiably $0
+    if not total_is_zero(checkout.locator("body").inner_text(timeout=10000)):
+        print("  Checkout total isn't verifiably $0 - NOT placing the order.")
+        return "aborted"
+    place_order.first.click()
 
     page.wait_for_timeout(2000)
     # Some regions show a refund-policy prompt
@@ -160,7 +176,7 @@ def claim(page, game):
         page.reload(wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
         label = (page.locator('[data-testid="purchase-cta-button"]').inner_text() or "").lower()
-        if "library" in label or "owned" in label:
+        if "in library" in label or "owned" in label:
             print("  Claimed!")
             return "claimed"
         print("  Not sure it worked - check your library.")
