@@ -30,6 +30,8 @@ LOGIN_URL = "https://www.epicgames.com/id/login"
 PROFILE_DIR = Path(__file__).parent / "profile"
 # Epic dropped the purchase-cta-button test id, so also match the button's name
 CTA_NAME = re.compile(r"^\s*(Get|In Library|Owned|Buy Now)\s*$", re.IGNORECASE)
+# The last button before the game is added: "Place Order" in checkout, or a popup's "Add to Library"
+ORDER_BTN_NAME = re.compile(r"^\s*(Place Order|Add to Library)\s*$", re.IGNORECASE)
 CDP_URL = "http://localhost:9222"
 CAPTCHA_WAIT_SECONDS = 300  # how long to wait for you to solve a CAPTCHA
 
@@ -108,10 +110,42 @@ def wait_for_human_if_captcha(page):
     raise RuntimeError("CAPTCHA wasn't solved in time")
 
 
-def total_is_zero(text):
-    """True only if the checkout text shows a Total and every Total is zero."""
+def total_is_zero(text, require_total=True):
+    """True if every Total in the text is zero. With require_total, a Total must exist."""
     amounts = re.findall(r"\btotal\b\D{0,20}?(\d[\d.,]*)", text, re.IGNORECASE)
-    return bool(amounts) and all(int(re.sub(r"\D", "", a)) == 0 for a in amounts)
+    if not amounts:
+        return not require_total
+    return all(int(re.sub(r"\D", "", a)) == 0 for a in amounts)
+
+
+def wait_for_order_button(page, checkout, timeout=20):
+    """Wait for the final confirm button, in the checkout iframe or a popup on the page.
+    Returns (scope, button, in_iframe), or (None, None, False) if it never shows up."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for scope, in_iframe in ((checkout, True), (page, False)):
+            btn = scope.get_by_role("button", name=ORDER_BTN_NAME).first
+            try:
+                if btn.is_visible():
+                    return scope, btn, in_iframe
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return None, None, False
+
+
+def save_debug(page, label):
+    """Record what's on screen so a failed claim can be diagnosed."""
+    try:
+        page.screenshot(path=str(Path(__file__).parent / "debug-last-failure.png"))
+        names = page.evaluate(
+            """() => [...document.querySelectorAll('button')]
+                .map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 30)"""
+        )
+        print(f"  [{label}] buttons on page: {names}")
+        print("  Saved a screenshot to debug-last-failure.png (don't share it; it may show your account).")
+    except Exception as e:
+        print(f"  (couldn't save debug info: {e})")
 
 
 def find_cta(page):
@@ -159,20 +193,22 @@ def claim(page, game):
     page.wait_for_timeout(3000)
     wait_for_human_if_captcha(page)
 
-    # Checkout happens inside an iframe
+    # Checkout is usually inside an iframe, but may be a popup with "Add to Library"
     checkout = page.frame_locator("#webPurchaseContainer iframe")
-    place_order = checkout.get_by_role("button", name="Place Order")
-    try:
-        place_order.first.wait_for(timeout=20000)
-    except PWTimeout:
-        print("  Couldn't find Place Order.")
+    scope, order_btn, in_iframe = wait_for_order_button(page, checkout)
+    if order_btn is None:
+        print("  Couldn't find Place Order / Add to Library.")
+        save_debug(page, game["title"])
         return "failed"
 
-    # Safety: never place an order unless the checkout total is verifiably $0
-    if not total_is_zero(checkout.locator("body").inner_text(timeout=10000)):
+    # Safety: never confirm if a checkout Total is anything but $0. In the iframe a
+    # $0 Total must be present; on a popup, no Total at all is OK (the feed said $0).
+    text = scope.locator("body").inner_text(timeout=10000)
+    if not total_is_zero(text, require_total=in_iframe):
         print("  Checkout total isn't verifiably $0 - NOT placing the order.")
+        save_debug(page, game["title"])
         return "aborted"
-    place_order.first.click()
+    order_btn.click()
 
     page.wait_for_timeout(2000)
     # Some regions show a refund-policy prompt
